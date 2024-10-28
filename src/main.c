@@ -10,7 +10,6 @@
 #include "nvs_flash.h"
 #include "mqtt_client.h"
 #include "esp_wifi.h"
-#include "GY521.h"
 
 // Configurações principais
 #define WIFI_SSID "your_wifi_ssid"
