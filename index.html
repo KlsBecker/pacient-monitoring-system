@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Patient Monitoring System</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation"></script> <!-- Plugin de anotação para Chart.js -->
+  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+  
+  <!-- Google Fonts for better typography -->
+  <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
+  
+  <style>
+    body {
+      font-family: 'Roboto', sans-serif;
+      background-color: #000; /* Fundo escuro para estilo de monitor */
+      color: #fff;
+      margin: 0;
+      padding: 0;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+    }
+
+    .container {
+      background-color: #1c1c1c;
+      border-radius: 10px;
+      padding: 30px;  /* Aumentando o padding */
+      max-width: 700px;  /* Aumentando a largura máxima */
+      width: 100%;
+      text-align: center;
+      box-shadow: 0 6px 12px rgba(0, 255, 0, 0.2); /* Sombra verde brilhante suave */
+    }
+
+    h1 {
+      color: #00ff00; /* Verde brilhante para estilo de monitor cardíaco */
+      font-weight: 700;
+      margin-bottom: 30px;  /* Aumentando o espaçamento */
+      font-size: 44px; /* Exibição grande da frequência cardíaca */
+      display: flex;
+      justify-content: center;
+      align-items: center;
+    }
+
+    .heart {
+      font-size: 40px; /* Coração menor */
+      color: #ff4b5c; /* Vermelho padrão para o coração */
+      animation: heartbeat 1s infinite;
+      margin-left: 10px; /* Espaçamento entre o texto e o coração */
+    }
+
+    .info {
+      display: flex;
+      justify-content: space-around;
+      margin-bottom: 30px;  /* Aumentando o espaçamento */
+    }
+
+    .info p {
+      font-size: 24px; /* Aumentando o tamanho da fonte */
+      display: flex;
+      align-items: center;
+    }
+
+    .info p strong {
+      margin-right: 10px;
+    }
+
+    .info i {
+      margin-right: 8px;
+    }
+
+    canvas {
+      margin-top: 30px;  /* Aumentando o espaçamento */
+      background-color: #1c1c1c; /* Fundo escuro para o gráfico */
+    }
+
+    .heart-rate-value {
+      font-size: 60px; /* Tamanho grande para o valor da frequência cardíaca */
+      color: #00ff00; /* Verde brilhante para o valor */
+      margin: 0;
+      padding: 15px 0;  /* Aumentando o padding */
+    }
+
+    /* Animação do coração pulsante */
+    @keyframes heartbeat {
+      0% {
+        transform: scale(1);
+      }
+      25% {
+        transform: scale(1.2);
+      }
+      50% {
+        transform: scale(1);
+      }
+      100% {
+        transform: scale(1);
+      }
+    }
+
+    /* Responsividade */
+    @media (max-width: 600px) {
+      .info {
+        flex-direction: column;
+        align-items: center;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <!-- Título com coração pulsante ao lado -->
+    <h1>
+      Heart Rate 
+      <span class="heart" id="heart">❤️</span>
+    </h1>
+
+    <!-- Exibição do valor atual de frequência cardíaca -->
+    <p id="currentHeartRate" class="heart-rate-value">--</p> <!-- Valor atual da frequência cardíaca -->
+
+    <!-- Exibe se houve queda e se está agitado -->
+    <div class="info">
+      <p id="fallText" class="fall"><i>⚠️</i><strong>Fall:</strong> <span id="fall">N/A</span></p>
+      <p id="agitationText" class="agitation"><i>⚡</i><strong>Agitation:</strong> <span id="agitation">N/A</span></p>
+    </div>
+
+    <!-- Gráfico para a frequência cardíaca -->
+    <canvas id="heartRateChart" width="500" height="250"></canvas> <!-- Aumentando o tamanho do canvas -->
+  </div>
+
+  <script>
+    // Configurando o cliente MQTT para conectar no broker test.mosquitto.org via WebSocket
+    const client = mqtt.connect('wss://test.mosquitto.org:8081/mqtt');
+
+    // Assinando os tópicos individualmente
+    client.on('connect', () => {
+      console.log('Connected to MQTT broker');
+      client.subscribe('patient_monitoring_system_aafk/fall');
+      client.subscribe('patient_monitoring_system_aafk/agitation');
+      client.subscribe('patient_monitoring_system_aafk/heart_rate');
+    });
+
+    // Variáveis para armazenar os dados
+    let heartRates = [];
+    let timestamps = [];
+    let pointColors = [];
+
+    // Função para ajustar a animação do coração com base na frequência cardíaca
+    function updateHeartAnimation(heartRate) {
+      const heartElement = document.getElementById('heart');
+
+      // Se o batimento for 0, para a animação do coração
+      if (heartRate === 0) {
+        heartElement.style.animation = 'none';  // Parar a animação
+      } else {
+        heartElement.style.animation = 'heartbeat 1s infinite'; // Voltar a animação se o batimento for > 0
+        const bpmInterval = (60 / heartRate) * 1000;  // Intervalo da animação em milissegundos baseado nos BPM
+        heartElement.style.animationDuration = `${bpmInterval}ms`;
+      }
+    }
+
+    // Gráfico de frequência cardíaca com a barra verde entre 60 e 120 BPM
+    const ctx = document.getElementById('heartRateChart').getContext('2d');
+    const chart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: timestamps,
+        datasets: [{
+          label: 'Heart Rate (BPM)',
+          data: heartRates,
+          borderColor: 'rgba(0, 255, 0, 1)', // Verde brilhante para linha do gráfico
+          backgroundColor: 'rgba(0, 255, 0, 0.2)', // Área verde clara abaixo do gráfico
+          borderWidth: 3,  // Aumentando a espessura da linha
+          fill: true,
+          tension: 0.4,
+          pointRadius: 6,  // Aumentando o tamanho dos pontos
+          pointBackgroundColor: pointColors, // Define cores para os pontos
+        }]
+      },
+      options: {
+        scales: {
+          x: {
+            title: {
+              display: true,
+              text: 'Time',
+              color: '#ccc',  // Cor clara para melhor visibilidade no fundo escuro
+              font: {
+                size: 20,  // Aumentando o tamanho da fonte
+                weight: 'bold'
+              }
+            },
+            ticks: {
+              color: '#ccc',  // Cor clara para as labels
+              font: {
+                size: 18  // Aumentando o tamanho das labels dos ticks
+              }
+            }
+          },
+          y: {
+            title: {
+              display: true,
+              text: 'BPM',
+              color: '#ccc',  // Cor clara para melhor visibilidade no fundo escuro
+              font: {
+                size: 20,  // Aumentando o tamanho da fonte
+                weight: 'bold'
+              }
+            },
+            ticks: {
+              color: '#ccc',  // Cor clara para as labels
+              font: {
+                size: 18  // Aumentando o tamanho das labels dos ticks
+              }
+            },
+            beginAtZero: true,
+            min: 0,      // Definir valor mínimo do gráfico
+            max: 200,    // Definir valor máximo do gráfico
+            suggestedMax: 200
+          }
+        },
+        plugins: {
+          annotation: {
+            annotations: {
+              box1: {
+                type: 'box',
+                yMin: 60,  // Área de 60 BPM
+                yMax: 120,  // Área até 120 BPM
+                backgroundColor: 'rgba(75, 192, 192, 0.25)',  // Verde claro para a área aceitável
+                borderColor: 'rgba(75, 192, 192, 1)',
+                borderWidth: 1,
+              }
+            }
+          },
+          legend: {
+            display: true,
+            labels: {
+              color: '#ccc',  // Cor clara para as labels da legenda
+              font: {
+                size: 18  // Aumentando o tamanho da fonte da legenda
+              }
+            }
+          }
+        }
+      }
+    });
+
+    // Função para atualizar o gráfico e o valor atual da frequência cardíaca
+    function updateChart(heartRate) {
+      const now = new Date().toLocaleTimeString();
+      
+      // Convertendo a frequência cardíaca para inteiro
+      heartRate = Math.round(heartRate);
+
+      // Atualizar a animação do coração com base na frequência
+      updateHeartAnimation(heartRate);
+
+      // Exibindo o valor atual de frequência cardíaca
+      const heartRateElement = document.getElementById('currentHeartRate');
+      heartRateElement.textContent = heartRate;
+
+      // Alterando a cor do valor de frequência cardíaca em tempo real
+      if (heartRate === 0) {
+        heartRateElement.style.color = 'rgba(255, 0, 0, 1)'; // Vermelho forte para batimento 0
+      } else if (heartRate < 60 || heartRate > 120) {
+        heartRateElement.style.color = 'rgba(220, 53, 69, 1)'; // Vermelho suave se fora dos parâmetros
+      } else {
+        heartRateElement.style.color = '#00ff00'; // Verde brilhante se dentro dos parâmetros
+      }
+
+      // Adicionando dados ao gráfico
+      heartRates.push(heartRate);
+      timestamps.push(now);
+
+      // Definir cor do ponto com base no valor da frequência
+      if (heartRate < 60 || heartRate > 120 || heartRate === 0) {
+        pointColors.push('rgba(220, 53, 69, 1)');  // Vermelho suave e mais visível se fora do intervalo
+      } else {
+        pointColors.push('rgba(0, 255, 0, 1)');  // Verde se dentro do intervalo
+      }
+
+      // Manter apenas os últimos 20 pontos no gráfico
+      if (heartRates.length > 20) {
+        heartRates.shift();
+        timestamps.shift();
+        pointColors.shift();
+      }
+
+      chart.update();
+    }
+
+    // Função para atualizar a cor do texto e valor baseado no status
+    function updateTextColor(elementId, textElementId, value) {
+      const element = document.getElementById(elementId);
+      const textElement = document.getElementById(textElementId);
+      if (value === true) {
+        element.style.color = 'rgba(220, 53, 69, 1)';  // Vermelho suave quando true
+        textElement.style.color = 'rgba(220, 53, 69, 1)';
+        element.textContent = 'Yes';
+      } else if (value === false) {
+        element.style.color = 'rgba(0, 255, 0, 1)';  // Verde quando false
+        textElement.style.color = 'rgba(0, 255, 0, 1)';
+        element.textContent = 'No';
+      } else {
+        element.style.color = 'white';  // Branco quando não há dados
+        textElement.style.color = 'white';
+        element.textContent = 'N/A';
+      }
+    }
+
+    // Recebendo mensagens via MQTT de diferentes tópicos
+    client.on('message', (topic, message) => {
+      const value = message.toString();
+
+      // Verificando o tópico e atualizando os dados adequadamente
+      if (topic === 'patient_monitoring_system_aafk/heart_rate') {
+        const heartRate = parseInt(value); // Converte o valor para número inteiro
+        updateChart(heartRate);
+      } else if (topic === 'patient_monitoring_system_aafk/fall') {
+        const fall = (value === 'true'); // Converte o valor para boolean
+        updateTextColor('fall', 'fallText', fall);
+      } else if (topic === 'patient_monitoring_system_aafk/agitation') {
+        const agitation = (value === 'true'); // Converte o valor para boolean
+        updateTextColor('agitation', 'agitationText', agitation);
+      }
+    });
+  </script>
+</body>
+</html>
