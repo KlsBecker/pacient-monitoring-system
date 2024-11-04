@@ -11,11 +11,16 @@
 #include "mqtt_client.h"
 #include "esp_wifi.h"
 
+// Configurações do MQTT
+#define MQTT_URI                    "mqtt://test.mosquitto.org:1883"  // Mudado para protocolo MQTT direto
+#define MQTT_TOPIC_ROOT             "patient_monitoring_system_aafk"
+#define MQTT_TOPIC_HEARTRATE        MQTT_TOPIC_ROOT "/heart_rate"
+#define MQTT_TOPIC_FALL             MQTT_TOPIC_ROOT "/fall"
+#define MQTT_TOPIC_AGITATION        MQTT_TOPIC_ROOT "/agitation"
+
 // Configurações principais
-#define WIFI_SSID "your_wifi_ssid"
-#define WIFI_PASSWORD "your_wifi_password"
-#define MQTT_URI "mqtt://mqtt_server_ip"
-#define MQTT_TOPIC_ALERT "patient/alert"
+#define WIFI_SSID "iPhone de Klaus"
+#define WIFI_PASSWORD "batebola"
 
 // Limites para frequência cardíaca
 #define HEART_RATE_MIN 60
@@ -43,14 +48,14 @@ typedef enum {
 } alarm_event_t;
 
 // Variáveis globais
-static const char *TAG = "HeartSafeSystem";
+static const char *TAG = "PatientMonitoringSystem";
 int heart_rate = 0;  // Variável simulada para frequência cardíaca
+bool fallen = false;
+bool agitaded = false;
 esp_mqtt_client_handle_t mqtt_client;
 QueueHandle_t alarm_queue;
 QueueHandle_t reset_button_queue;
-
-// Instanciando o objeto MPU6050
-MPU6050 mpu(Wire);
+bool wifi_connected = false;  // Variável para verificar se Wi-Fi está conectado
 
 // Funções de conexão Wi-Fi e MQTT
 void wifi_init();
@@ -59,21 +64,22 @@ void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event
 
 // Funções para simular sensores
 int read_heart_rate();  // Simula leitura do sensor de frequência cardíaca
+bool is_fallen();
+bool is_agitaded();
 
 // Funções principais das tasks
 void task_monitor_heart_rate(void *param);
 void task_monitor_movement(void *param);
 void task_alarm_handler(void *param);
 void task_reset_button_handler(void *param);
+void task_wifi_led_indicator(void *param);
 
 // Função para inicializar botão de reset
 void reset_button_init();
+void led_wifi_init();
 
 // Prototipo da função ISR do botão
-static void IRAM_ATTR gpio_isr_handler(void *arg);
-
-// Função para detecção de queda
-void detect_fall_and_agitation();
+static void gpio_isr_handler(void *arg);
 
 void app_main() {
     // Inicializar armazenamento NVS para Wi-Fi
@@ -84,15 +90,9 @@ void app_main() {
     }
     ESP_ERROR_CHECK(ret);
 
-    // Inicializar Wi-Fi e MQTT
+    // Inicializar Wi-Fi
     wifi_init();
-    mqtt_init();
-
-    // Inicializar MPU6050
-    Wire.begin();
-    mpu.begin();
-    mpu.calcGyroOffsets(true);  // Calibrando o giroscópio
-
+    led_wifi_init();
     // Inicializar botão de reset
     reset_button_init();
 
@@ -104,6 +104,7 @@ void app_main() {
     xTaskCreate(task_monitor_movement, "MonitorMovement", TASK_STACK_SIZE, NULL, 1, NULL);
     xTaskCreate(task_alarm_handler, "AlarmHandler", TASK_STACK_SIZE, NULL, 1, NULL);
     xTaskCreate(task_reset_button_handler, "ResetButtonHandler", TASK_STACK_SIZE, NULL, 1, NULL);
+    xTaskCreate(task_wifi_led_indicator, "WifiLEDIndicator", TASK_STACK_SIZE, NULL, 1, NULL);
 }
 
 /**
@@ -162,15 +163,13 @@ void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event
  * Task para monitorar a frequência cardíaca a cada 10 segundos
  */
 void task_monitor_heart_rate(void *param) {
+    char heart_rate_str[10];
     while (true) {
         heart_rate = read_heart_rate();
         ESP_LOGI(TAG, "Heart Rate: %d bpm", heart_rate);
-
-        if (heart_rate < HEART_RATE_MIN || heart_rate > HEART_RATE_MAX) {
-            alarm_event_t event = ALARM_TRIGGERED;
-            xQueueSend(alarm_queue, &event, portMAX_DELAY);  // Envia evento de alarme ativado para a fila
-            esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC_ALERT, "Heart rate out of range!", 0, 1, 0);
-        }
+        
+        sprintf(heart_rate_str, "%d", heart_rate);
+        esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC_HEARTRATE, heart_rate_str, strlen(heart_rate_str), 0, 0);
 
         vTaskDelay(pdMS_TO_TICKS(HEART_MONITOR_INTERVAL_MS));
     }
@@ -181,9 +180,14 @@ void task_monitor_heart_rate(void *param) {
  */
 void task_monitor_movement(void *param) {
     while (true) {
-        // Atualizar os dados do MPU6050
-        mpu.update();
-        detect_fall_and_agitation();
+        fallen = is_fallen();
+        
+        esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC_FALL, fallen ? "1"  : "0", 1, 0, 0);
+
+        agitaded = is_agitaded();
+
+        esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC_AGITATION, agitaded ? "1"  : "0", 1, 0, 0);
+
         vTaskDelay(pdMS_TO_TICKS(MOVEMENT_MONITOR_INTERVAL_MS));
     }
 }
@@ -198,11 +202,9 @@ void task_alarm_handler(void *param) {
             switch (event) {
                 case ALARM_TRIGGERED:
                     ESP_LOGW(TAG, "Alarm triggered! Taking action...");
-                    // Aqui pode acionar um buzzer ou outro dispositivo de alarme
                     break;
                 case ALARM_RESET:
                     ESP_LOGI(TAG, "Alarm reset!");
-                    // Resetar o estado do alarme
                     break;
             }
         }
@@ -239,7 +241,6 @@ void reset_button_init() {
     };
     gpio_config(&io_conf);
 
-    // Criar uma task que monitora o estado do botão
     gpio_install_isr_service(0);
     gpio_isr_handler_add(RESET_BUTTON_GPIO, gpio_isr_handler, (void *)RESET_BUTTON_GPIO);
 }
@@ -252,44 +253,17 @@ int read_heart_rate() {
 }
 
 /**
- * Detecta queda e agitação com base nos valores do MPU6050
- */
-void detect_fall_and_agitation() {
-    float accel = mpu.getAccZ();
-    float gyro = mpu.getGyroZ();
-    static bool fall_detected = false;
-    static TickType_t fall_start_time = 0;
+ * Simula a verificação de queda
+*/
+bool is_fallen() {
+    return (rand() == 1);
+}
 
-    // Detecção de queda: pico seguido de estabilidade
-    if (accel > FALL_THRESHOLD) {
-        ESP_LOGI(TAG, "Possible fall detected, checking stability...");
-        fall_detected = true;
-        fall_start_time = xTaskGetTickCount();
-    }
-
-    // Após o pico de aceleração, verifica se há estabilidade
-    if (fall_detected) {
-        if (fabs(accel) < STABILITY_THRESHOLD && fabs(gyro) < STABILITY_THRESHOLD) {
-            if (xTaskGetTickCount() - fall_start_time > pdMS_TO_TICKS(STABILITY_DURATION_MS)) {
-                ESP_LOGI(TAG, "Fall confirmed, patient is stable.");
-                fall_detected = false;
-                alarm_event_t event = ALARM_TRIGGERED;
-                xQueueSend(alarm_queue, &event, portMAX_DELAY);  // Envia evento de queda para a fila
-                esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC_ALERT, "Fall detected!", 0, 1, 0);
-            }
-        } else {
-            // Se os valores estão flutuando, ainda não consideramos uma queda completa
-            ESP_LOGI(TAG, "Stability not reached after fall detection.");
-        }
-    }
-
-    // Detecção de agitação: se houver muita variação nos dados
-    if (fabs(accel) > AGITATION_THRESHOLD || fabs(gyro) > AGITATION_THRESHOLD) {
-        ESP_LOGI(TAG, "Agitated movement detected!");
-        alarm_event_t event = ALARM_TRIGGERED;
-        xQueueSend(alarm_queue, &event, portMAX_DELAY);  // Envia evento de agitação para a fila
-        esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC_ALERT, "Agitated movement detected!", 0, 1, 0);
-    }
+/**
+ * Simula a verificação de agitação
+*/
+bool is_agitaded() {
+    return (rand() == 1);
 }
 
 /**
@@ -299,4 +273,34 @@ static void IRAM_ATTR gpio_isr_handler(void *arg) {
     int pin = (int)arg;
     int state = gpio_get_level(pin);
     xQueueSendFromISR(reset_button_queue, &state, NULL);
+}
+
+#define WIFI_LED_GPIO GPIO_NUM_2  // LED no GPIO 2
+
+// Função para inicializar o LED
+void led_wifi_init() {
+    gpio_reset_pin(WIFI_LED_GPIO);
+    gpio_set_direction(WIFI_LED_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(WIFI_LED_GPIO, 0);  // LED desligado inicialmente
+}
+
+// Task para piscar o LED enquanto o Wi-Fi não estiver conectado
+void task_wifi_led_indicator(void *param) {
+    wifi_ap_record_t ap_info;
+
+    while (true) {
+        if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+            if (!wifi_connected) {
+                wifi_connected = true;
+                mqtt_init();  // Inicializa o MQTT apenas após conectar ao Wi-Fi
+            }
+            gpio_set_level(WIFI_LED_GPIO, 1);  // LED ligado (fixo)
+        } else {
+            wifi_connected = false;
+            gpio_set_level(WIFI_LED_GPIO, !gpio_get_level(WIFI_LED_GPIO));  // Pisca o LED
+            vTaskDelay(pdMS_TO_TICKS(500));  // Ajuste o delay para a taxa de pisca
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(500));  // Reduz frequência de verificação para Wi-Fi
+    }
 }
