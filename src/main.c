@@ -10,6 +10,14 @@
 #include "nvs_flash.h"
 #include "mqtt_client.h"
 #include "esp_wifi.h"
+#include "mpu6050.h"
+#include "driver/i2c.h"
+
+//Configurações do I2C
+#define I2C_MASTER_SCL_IO 22       // GPIO para SCL do I2C
+#define I2C_MASTER_SDA_IO 21       // GPIO para SDA do I2C
+#define I2C_MASTER_NUM I2C_NUM_0   // Porta I2C
+#define I2C_MASTER_FREQ_HZ 100000  // Frequência I2C
 
 // Configurações do MQTT
 #define MQTT_URI                    "mqtt://test.mosquitto.org:1883"  // Mudado para protocolo MQTT direto
@@ -33,7 +41,8 @@
 #define STABILITY_DURATION_MS 3000  // Tempo de estabilidade (em ms) para confirmar uma queda
 
 // Configurações do botão de reset (GPIO)
-#define RESET_BUTTON_GPIO GPIO_NUM_0  // Usando GPIO0 como exemplo
+#define RESET_BUTTON_GPIO GPIO_NUM_23  // Usando GPIO0 como exemplo
+#define ALARM_LED_GPIO GPIO_NUM_14
 
 // Configurações de FreeRTOS
 #define TASK_STACK_SIZE 4096
@@ -81,7 +90,29 @@ void led_wifi_init();
 // Prototipo da função ISR do botão
 static void gpio_isr_handler(void *arg);
 
+void i2c_master_init() {
+    i2c_config_t i2c_config = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_MASTER_SDA_IO,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_io_num = I2C_MASTER_SCL_IO,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = I2C_MASTER_FREQ_HZ,
+    };
+    i2c_param_config(I2C_MASTER_NUM, &i2c_config);
+    i2c_driver_install(I2C_MASTER_NUM, i2c_config.mode, 0, 0, 0);
+}
+
+void alarm_led_init() {
+    gpio_reset_pin(ALARM_LED_GPIO);
+    gpio_set_direction(ALARM_LED_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(ALARM_LED_GPIO, 0);  // LED desligado inicialmente
+}
+
 void app_main() {
+    i2c_master_init();
+    mpu6050_init(I2C_MASTER_NUM);
+
     // Inicializar armazenamento NVS para Wi-Fi
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -95,6 +126,8 @@ void app_main() {
     led_wifi_init();
     // Inicializar botão de reset
     reset_button_init();
+    // Inicializar LED local
+    alarm_led_init();
 
     // Criar fila de eventos de alarme
     alarm_queue = xQueueCreate(10, sizeof(alarm_event_t));
@@ -179,16 +212,28 @@ void task_monitor_heart_rate(void *param) {
  * Task para monitorar movimento a cada 500ms (queda/agitação)
  */
 void task_monitor_movement(void *param) {
+    mpu6050_data_t sensor_data;
+
     while (true) {
-        fallen = is_fallen();
-        
-        esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC_FALL, fallen ? "1"  : "0", 1, 0, 0);
+        if (mpu6050_read_accel_gyro(I2C_MASTER_NUM, &sensor_data) == ESP_OK) {
+            agitaded |= detect_agitation(&sensor_data);
+            ESP_LOGI(TAG, "agitação: %s", agitaded ? "yes" : "no");
 
-        agitaded = is_agitaded();
+            esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC_AGITATION, agitaded ? "true" : "false", 0, 0, 0);
 
-        esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC_AGITATION, agitaded ? "1"  : "0", 1, 0, 0);
+            fallen |= detect_fall(&sensor_data) && !agitaded;
+            ESP_LOGI(TAG, "Queda: %s", fallen ? "yes" : "no");
 
-        vTaskDelay(pdMS_TO_TICKS(MOVEMENT_MONITOR_INTERVAL_MS));
+            esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC_FALL, fallen ? "true" : "false", 0, 0, 0);
+
+            if (fallen || agitaded) {
+                alarm_event_t event = ALARM_TRIGGERED;
+                xQueueSend(alarm_queue, &event, portMAX_DELAY);  // Envia evento de trigger do alarme para a fila
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(MOVEMENT_MONITOR_INTERVAL_MS));
+
+        }
     }
 }
 
@@ -202,9 +247,12 @@ void task_alarm_handler(void *param) {
             switch (event) {
                 case ALARM_TRIGGERED:
                     ESP_LOGW(TAG, "Alarm triggered! Taking action...");
+                    gpio_set_level(ALARM_LED_GPIO, 1);  // Acende o LED de alarme
                     break;
                 case ALARM_RESET:
                     ESP_LOGI(TAG, "Alarm reset!");
+                    gpio_set_level(ALARM_LED_GPIO, 0);  // Apaga o LED de alarme
+                    fallen = agitaded = false;
                     break;
             }
         }
