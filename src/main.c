@@ -12,6 +12,7 @@
 #include "esp_wifi.h"
 #include "mpu6050.h"
 #include "driver/i2c.h"
+#include "max30201.h"
 
 //Configurações do I2C
 #define I2C_MASTER_SCL_IO 22       // GPIO para SCL do I2C
@@ -71,11 +72,6 @@ void wifi_init();
 void mqtt_init();
 void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data);
 
-// Funções para simular sensores
-int read_heart_rate();  // Simula leitura do sensor de frequência cardíaca
-bool is_fallen();
-bool is_agitaded();
-
 // Funções principais das tasks
 void task_monitor_heart_rate(void *param);
 void task_monitor_movement(void *param);
@@ -112,6 +108,7 @@ void alarm_led_init() {
 void app_main() {
     i2c_master_init();
     mpu6050_init(I2C_MASTER_NUM);
+    max30201_init();
 
     // Inicializar armazenamento NVS para Wi-Fi
     esp_err_t ret = nvs_flash_init();
@@ -198,11 +195,15 @@ void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event
 void task_monitor_heart_rate(void *param) {
     char heart_rate_str[10];
     while (true) {
-        heart_rate = read_heart_rate();
-        ESP_LOGI(TAG, "Heart Rate: %d bpm", heart_rate);
-        
-        sprintf(heart_rate_str, "%d", heart_rate);
-        esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC_HEARTRATE, heart_rate_str, strlen(heart_rate_str), 0, 0);
+        heart_rate = max30201_read_data();  // Leitura real do sensor MAX30201
+        if (heart_rate >= 0) {  // Confirma que a leitura foi bem-sucedida
+            ESP_LOGI(TAG, "Heart Rate: %d bpm", heart_rate);
+
+            sprintf(heart_rate_str, "%d", heart_rate);
+            esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC_HEARTRATE, heart_rate_str, strlen(heart_rate_str), 0, 0);
+        } else {
+            ESP_LOGW(TAG, "Erro ao ler frequência cardíaca");
+        }
 
         vTaskDelay(pdMS_TO_TICKS(HEART_MONITOR_INTERVAL_MS));
     }
@@ -291,27 +292,6 @@ void reset_button_init() {
 
     gpio_install_isr_service(0);
     gpio_isr_handler_add(RESET_BUTTON_GPIO, gpio_isr_handler, (void *)RESET_BUTTON_GPIO);
-}
-
-/**
- * Simula a leitura do sensor de frequência cardíaca (MAX30102)
- */
-int read_heart_rate() {
-    return (rand() % (HEART_RATE_MAX + 20));  // Valor entre 0 e 120
-}
-
-/**
- * Simula a verificação de queda
-*/
-bool is_fallen() {
-    return (rand() == 1);
-}
-
-/**
- * Simula a verificação de agitação
-*/
-bool is_agitaded() {
-    return (rand() == 1);
 }
 
 /**
